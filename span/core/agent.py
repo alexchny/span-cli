@@ -13,6 +13,13 @@ from span.tools.file_ops import ApplyPatchTool, ReadFileTool
 from span.tools.shell import RunShellTool
 
 
+class RevertError(Exception):
+    def __init__(self, failed_ops: list[tuple[str, str, str]]):
+        self.failed_ops = failed_ops
+        paths = [op[0] for op in failed_ops]
+        super().__init__(f"Failed to revert changes in: {', '.join(paths)}")
+
+
 @dataclass
 class ChangeOp:
     path: str
@@ -136,8 +143,11 @@ class Agent:
             if not self.llm_client.has_tool_use(response):
                 break
 
+            state.messages.append({"role": "assistant", "content": response})
+
             tool_calls = self.llm_client.extract_tool_calls(response)
             tool_results = []
+            hit_limit = False
 
             for tool_call in tool_calls:
                 state.tool_call_count += 1
@@ -147,6 +157,7 @@ class Agent:
 
                 if limit := self._check_limits(state):
                     print(f"⚠ Stopped: {limit} limit reached")
+                    hit_limit = True
                     break
 
                 result = self._execute_tool(tool_call, state)
@@ -170,6 +181,9 @@ class Agent:
                     session_id=state.session_id,
                     result=result,
                 )
+
+            if hit_limit:
+                break
 
             if tool_results:
                 state.messages.append({"role": "user", "content": tool_results})
@@ -234,7 +248,18 @@ class Agent:
                 }
             ]
         else:
-            self._revert_last(state)
+            if apply_result.reverse_diff:
+                revert_result = self.apply_patch_tool.execute(
+                    path=path, diff=apply_result.reverse_diff
+                )
+                if not revert_result.success:
+                    self.event_stream.append(
+                        "revert_failed",
+                        session_id=state.session_id,
+                        path=path,
+                        error=revert_result.error,
+                    )
+
             state.last_errors = verification.errors
             error_msg = "\n".join(verification.errors)
             return [
@@ -244,17 +269,20 @@ class Agent:
                 }
             ]
 
-    def _revert_last(self, state: AgentState) -> None:
-        if state.changes:
-            op = state.changes.pop()
-            self._apply_reverse_diff(op.path, op.reverse_diff)
-
-    def _apply_reverse_diff(self, path: str, reverse_diff: str) -> None:
-        self.apply_patch_tool.execute(path=path, diff=reverse_diff)
+    def _apply_reverse_diff(self, path: str, reverse_diff: str) -> bool:
+        result = self.apply_patch_tool.execute(path=path, diff=reverse_diff)
+        return result.success
 
     def revert_all(self, changes: list[ChangeOp]) -> None:
+        failed_ops: list[tuple[str, str, str]] = []
+
         for op in reversed(changes):
-            self._apply_reverse_diff(op.path, op.reverse_diff)
+            success = self._apply_reverse_diff(op.path, op.reverse_diff)
+            if not success:
+                failed_ops.append((op.path, op.reverse_diff, f"Failed to revert {op.path}"))
+
+        if failed_ops:
+            raise RevertError(failed_ops)
 
     def finalize(self, state: AgentState) -> bool:
         if not state.changes:

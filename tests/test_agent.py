@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 
 from span.config import Config
 from span.context.repo_map import RepoMap
-from span.core.agent import Agent, AgentState, ChangeOp
+from span.core.agent import Agent, AgentState, ChangeOp, RevertError
 from span.core.verifier import VerificationResult, Verifier
 from span.events.stream import EventStream
 from span.llm.client import LLMClient
@@ -161,26 +161,32 @@ def test_execute_patch_with_verification_failure(tmp_path: Path) -> None:
     test_file = tmp_path / "test.py"
     test_file.write_text("old content")
 
+    call_count = [0]
+
+    def mock_execute_side_effect(path: str, diff: str) -> MagicMock:
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return MagicMock(success=True, reverse_diff="- new\n+ old", error=None)
+        else:
+            return MagicMock(success=True, reverse_diff=None, error=None)
+
     with patch.object(agent.apply_patch_tool, "execute") as mock_apply:
-        mock_apply.return_value = MagicMock(
-            success=True, reverse_diff="- new\n+ old", error=None
-        )
+        mock_apply.side_effect = mock_execute_side_effect
 
         with patch.object(agent.verifier, "verify_patch") as mock_verify:
             mock_verify.return_value = VerificationResult(
                 passed=False, errors=["Syntax error"]
             )
 
-            with patch.object(agent, "_revert_last") as mock_revert:
-                tool_input = {"path": str(test_file), "diff": "+ new line"}
-                result = agent._execute_patch_with_verification(tool_input, state)
+            tool_input = {"path": str(test_file), "diff": "+ new line"}
+            result = agent._execute_patch_with_verification(tool_input, state)
 
-                assert isinstance(result, list)
-                assert len(result) > 0
-                assert "reverted" in result[0]["text"].lower()
-                assert "syntax error" in result[0]["text"].lower()
-                assert len(state.changes) == 0
-                mock_revert.assert_called_once()
+            assert isinstance(result, list)
+            assert len(result) > 0
+            assert "reverted" in result[0]["text"].lower()
+            assert "syntax error" in result[0]["text"].lower()
+            assert len(state.changes) == 0
+            assert mock_apply.call_count == 2
 
 
 def test_revert_all_changes() -> None:
@@ -316,3 +322,57 @@ def test_finalize_with_changes_revert(tmp_path: Path) -> None:
 
             assert result is False
             mock_revert.assert_called_once_with(state.changes)
+
+
+def test_revert_error_exception() -> None:
+    err = RevertError([
+        ("file1.py", "diff1", "Failed to revert file1.py"),
+        ("file2.py", "diff2", "Failed to revert file2.py"),
+    ])
+    assert "file1.py" in str(err)
+    assert "file2.py" in str(err)
+    assert len(err.failed_ops) == 2
+
+
+def test_revert_all_raises_on_failure() -> None:
+    config = Config()
+    repo_map = MagicMock(spec=RepoMap)
+    llm_client = MagicMock(spec=LLMClient)
+    verifier = MagicMock(spec=Verifier)
+    event_stream = MagicMock(spec=EventStream)
+
+    agent = Agent(config, repo_map, llm_client, verifier, event_stream)
+
+    changes = [
+        ChangeOp("file1.py", "f1", "r1", 1.0, 1),
+        ChangeOp("file2.py", "f2", "r2", 2.0, 2),
+    ]
+
+    with patch.object(agent.apply_patch_tool, "execute") as mock_apply:
+        mock_apply.return_value = MagicMock(success=False, error="Revert failed")
+
+        import pytest
+        with pytest.raises(RevertError) as exc_info:
+            agent.revert_all(changes)
+
+        assert len(exc_info.value.failed_ops) == 2
+        assert "file1.py" in str(exc_info.value)
+
+
+def test_apply_reverse_diff_returns_success() -> None:
+    config = Config()
+    repo_map = MagicMock(spec=RepoMap)
+    llm_client = MagicMock(spec=LLMClient)
+    verifier = MagicMock(spec=Verifier)
+    event_stream = MagicMock(spec=EventStream)
+
+    agent = Agent(config, repo_map, llm_client, verifier, event_stream)
+
+    with patch.object(agent.apply_patch_tool, "execute") as mock_apply:
+        mock_apply.return_value = MagicMock(success=True)
+        result = agent._apply_reverse_diff("test.py", "reverse diff")
+        assert result is True
+
+        mock_apply.return_value = MagicMock(success=False)
+        result = agent._apply_reverse_diff("test.py", "reverse diff")
+        assert result is False
