@@ -1,3 +1,4 @@
+import logging
 import re
 import subprocess
 from pathlib import Path
@@ -5,6 +6,8 @@ from typing import Any
 
 from span.models.tools import ApplyPatchResult, ToolResult
 from span.tools.base import Tool
+
+logger = logging.getLogger(__name__)
 
 
 class ReadFileTool(Tool):
@@ -77,53 +80,78 @@ class ApplyPatchTool(Tool):
     @property
     def parameters(self) -> dict[str, Any]:
         return {
-            "patch": {
+            "path": {
                 "type": "string",
-                "description": "Unified diff format patch with proper headers and context",
+                "description": "Path to the file to patch",
+                "required": True,
+            },
+            "diff": {
+                "type": "string",
+                "description": "Unified diff content (without file headers). Must include ≥3 context lines before OR after changes.",
                 "required": True,
             },
         }
 
     def execute(self, **kwargs: Any) -> ApplyPatchResult:
-        patch = kwargs["patch"]
+        file_path_str = kwargs["path"]
+        diff_content = kwargs["diff"]
+        file_path = Path(file_path_str)
 
-        file_path = self._extract_file_path(patch)
-        if not file_path:
+        validation_error = self._validate_patch_with_reason(diff_content)
+        if validation_error:
             return ApplyPatchResult(
                 success=False,
                 output="",
-                error="Could not extract file path from patch headers",
+                error=f"Invalid patch format: {validation_error}. Use proper unified diff with @@ hunk headers and +/- line prefixes.",
             )
 
-        if not self._validate_patch(patch):
+        if diff_content.strip().startswith("---") or diff_content.strip().startswith("diff --git"):
+            full_patch = diff_content
+        else:
+            full_patch = f"--- {file_path_str}\n+++ {file_path_str}\n{diff_content}"
+
+        reverse_diff = self._generate_reverse_diff(file_path, full_patch)
+
+        strip_level = "1" if ("--- a/" in full_patch or "+++ b/" in full_patch) else "0"
+
+        try:
+            result = subprocess.run(
+                ["patch", f"-p{strip_level}"],
+                input=full_patch.encode(),
+                capture_output=True,
+            )
+        except FileNotFoundError:
             return ApplyPatchResult(
                 success=False,
                 output="",
-                error="Patch validation failed: insufficient context lines or lazy patterns detected",
+                error="'patch' command not found. Please install patch utility.",
             )
-
-        reverse_diff = self._generate_reverse_diff(file_path, patch)
-
-        result = subprocess.run(
-            ["patch", "-p0"],
-            input=patch.encode(),
-            capture_output=True,
-        )
 
         if result.returncode == 0:
             return ApplyPatchResult(
                 success=True,
-                output=f"Patch applied successfully to {file_path}",
-                file_path=str(file_path),
+                output=f"Patch applied successfully to {file_path_str}",
+                file_path=file_path_str,
                 reverse_diff=reverse_diff,
             )
         else:
             error_output = result.stderr.decode() if result.stderr else "Unknown error"
+            stdout_output = result.stdout.decode() if result.stdout else ""
+            line_count = self._safe_line_count(file_path)
+            hint = f" (file has {line_count} lines)" if "No such line" in stdout_output and line_count >= 0 else ""
             return ApplyPatchResult(
                 success=False,
-                output=error_output,
-                error="Patch failed to apply",
+                output=f"{error_output}\n{stdout_output}".strip(),
+                error=f"Patch failed{hint}: {error_output or stdout_output}",
             )
+
+    def _safe_line_count(self, file_path: Path) -> int:
+        if not file_path.exists():
+            return -1
+        try:
+            return len(file_path.read_text().splitlines())
+        except (OSError, UnicodeDecodeError):
+            return -1
 
     def _extract_file_path(self, patch: str) -> Path | None:
         for line in patch.split("\n"):
@@ -135,13 +163,40 @@ class ApplyPatchTool(Tool):
         return None
 
     def _validate_patch(self, patch: str) -> bool:
+        return self._validate_patch_with_reason(patch) is None
+
+    def _validate_patch_with_reason(self, patch: str) -> str | None:
         for pattern in self.LAZY_PATTERNS:
             if re.search(pattern, patch, re.IGNORECASE):
-                return False
+                return "contains lazy placeholder pattern"
+
+        if "@@" not in patch:
+            return "missing @@ hunk header"
 
         hunks = self._extract_hunks(patch)
+        if not hunks:
+            return "no valid hunks found"
+
         for hunk in hunks:
+            if not self._is_well_formed_hunk(hunk):
+                return "lines must start with space, +, or -"
             if not self._has_sufficient_context(hunk):
+                return "insufficient context lines"
+
+        return None
+
+    def _is_well_formed_hunk(self, hunk: str) -> bool:
+        lines = hunk.split("\n")
+        if not lines:
+            return False
+
+        if not lines[0].startswith("@@"):
+            return False
+
+        for line in lines[1:]:
+            if not line:
+                continue
+            if line[0] not in (" ", "+", "-", "\\"):
                 return False
 
         return True
@@ -172,10 +227,16 @@ class ApplyPatchTool(Tool):
         return hunks
 
     def _has_sufficient_context(self, hunk: str) -> bool:
+        hunk_header = hunk.split("\n")[0]
+        if hunk_header.startswith("@@"):
+            if "-0,0" in hunk_header or "@@ -0,0" in hunk_header:
+                return True
+
         lines = hunk.split("\n")[1:]
         context_before = 0
         context_after = 0
         seen_change = False
+        has_deletions = False
 
         for line in lines:
             if line.startswith(" "):
@@ -183,11 +244,27 @@ class ApplyPatchTool(Tool):
                     context_before += 1
                 else:
                     context_after += 1
-            elif line.startswith(("+", "-")):
+            elif line.startswith("-"):
+                seen_change = True
+                has_deletions = True
+                context_after = 0
+            elif line.startswith("+"):
                 seen_change = True
                 context_after = 0
 
-        return context_before >= 3 or context_after >= 3
+        if context_before >= 3 or context_after >= 3:
+            return True
+
+        if not has_deletions and context_before >= 1:
+            if context_before < 3:
+                logger.warning(
+                    "Accepting append-only patch with minimal context (%d line(s)). "
+                    "This may cause incorrect edits in repetitive code.",
+                    context_before,
+                )
+            return True
+
+        return False
 
     def _generate_reverse_diff(self, file_path: Path, patch: str) -> str | None:
         if not file_path.exists():
@@ -199,6 +276,10 @@ class ApplyPatchTool(Tool):
             lines.append(f"+++ {file_path}")
 
             for line in patch.split("\n"):
+                if line.startswith("--- ") or line.startswith("+++ "):
+                    continue
+                if line.startswith("diff ") or line.startswith("index "):
+                    continue
                 if line.startswith("@@"):
                     lines.append(line)
                 elif line.startswith("+"):
