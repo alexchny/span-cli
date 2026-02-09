@@ -93,9 +93,17 @@ class ApplyPatchTool(Tool):
         }
 
     def execute(self, **kwargs: Any) -> ApplyPatchResult:
-        file_path_str = kwargs["path"]
+        original_path = kwargs["path"]
         diff_content = kwargs["diff"]
-        file_path = Path(file_path_str)
+
+        repo_root = self._find_repo_root()
+        if repo_root:
+            file_path = repo_root / original_path
+        else:
+            file_path = Path(original_path).resolve()
+            repo_root = file_path.parent
+
+        file_path_str = str(file_path)
 
         validation_error = self._validate_patch_with_reason(diff_content)
         if validation_error:
@@ -114,11 +122,22 @@ class ApplyPatchTool(Tool):
 
         strip_level = "1" if ("--- a/" in full_patch or "+++ b/" in full_patch) else "0"
 
+        original_content: str | None = None
+        file_existed = file_path.exists()
+        if file_existed:
+            try:
+                original_content = file_path.read_text()
+            except (OSError, UnicodeDecodeError):
+                pass
+
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+
         try:
             result = subprocess.run(
                 ["patch", f"-p{strip_level}"],
                 input=full_patch.encode(),
                 capture_output=True,
+                cwd=repo_root,
             )
         except FileNotFoundError:
             return ApplyPatchResult(
@@ -130,20 +149,39 @@ class ApplyPatchTool(Tool):
         if result.returncode == 0:
             return ApplyPatchResult(
                 success=True,
-                output=f"Patch applied successfully to {file_path_str}",
-                file_path=file_path_str,
+                output=f"Patch applied successfully to {original_path}",
+                file_path=original_path,
                 reverse_diff=reverse_diff,
+                original_content=original_content,
             )
         else:
+            if original_content is not None:
+                try:
+                    file_path.write_text(original_content)
+                except OSError:
+                    pass
+            elif not file_existed and file_path.exists():
+                try:
+                    file_path.unlink()
+                except OSError:
+                    pass
+
             error_output = result.stderr.decode() if result.stderr else "Unknown error"
             stdout_output = result.stdout.decode() if result.stdout else ""
-            line_count = self._safe_line_count(file_path)
+            line_count = self._safe_line_count(file_path) if file_existed else -1
             hint = f" (file has {line_count} lines)" if "No such line" in stdout_output and line_count >= 0 else ""
             return ApplyPatchResult(
                 success=False,
                 output=f"{error_output}\n{stdout_output}".strip(),
                 error=f"Patch failed{hint}: {error_output or stdout_output}",
             )
+
+    def _find_repo_root(self) -> Path | None:
+        current = Path.cwd()
+        for parent in [current] + list(current.parents):
+            if (parent / "span.yaml").exists() or (parent / ".git").exists():
+                return parent
+        return None
 
     def _safe_line_count(self, file_path: Path) -> int:
         if not file_path.exists():

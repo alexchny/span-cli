@@ -20,3 +20,4 @@ class ToolResult:
 class ApplyPatchResult(ToolResult):
     file_path: str | None = None
     reverse_diff: str | None = None
+    original_content: str | None = None
