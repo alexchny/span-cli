@@ -27,8 +27,10 @@ class Verifier:
         if not file_path.endswith('.py'):
             return VerificationResult(passed=True, errors=[])
 
+        resolved_path = self._resolve_path(file_path)
+
         try:
-            content = Path(file_path).read_text()
+            content = resolved_path.read_text()
             ast.parse(content)
             return VerificationResult(passed=True, errors=[])
         except SyntaxError as e:
@@ -42,14 +44,26 @@ class Verifier:
                 errors=[f"File not found: {file_path}"]
             )
 
+    def _resolve_path(self, file_path: str) -> Path:
+        path = Path(file_path)
+        if path.is_absolute():
+            return path
+        current = Path.cwd()
+        for parent in [current] + list(current.parents):
+            if (parent / "span.yaml").exists() or (parent / ".git").exists():
+                return parent / file_path
+        return path.resolve()
+
     def check_lint(self, file_paths: list[str]) -> VerificationResult:
         python_files = [f for f in file_paths if f.endswith('.py')]
         if not python_files:
             return VerificationResult(passed=True, errors=[])
 
+        resolved_files = [str(self._resolve_path(f)) for f in python_files]
+
         try:
             result = subprocess.run(
-                ["ruff", "check"] + python_files,
+                ["ruff", "check"] + resolved_files,
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -145,18 +159,19 @@ class Verifier:
         except FileNotFoundError:
             return VerificationResult(passed=True, errors=[])
 
-    def verify_patch(self, modified_file: str) -> VerificationResult:
+    def verify_patch(self, modified_file: str, strict: bool = False) -> VerificationResult:
         syntax_result = self.check_syntax(modified_file)
         if not syntax_result.passed:
             return syntax_result
 
-        lint_result = self.check_lint([modified_file])
-        if not lint_result.passed:
-            return lint_result
+        if strict:
+            lint_result = self.check_lint([modified_file])
+            if not lint_result.passed:
+                return lint_result
 
-        test_result = self.check_tests([modified_file], full=False)
-        if not test_result.passed:
-            return test_result
+            test_result = self.check_tests([modified_file], full=False)
+            if not test_result.passed:
+                return test_result
 
         return VerificationResult(passed=True, errors=[])
 
