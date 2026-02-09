@@ -12,6 +12,7 @@ class ProgramRules(TypedDict):
 
 
 ALLOWED_PROGRAMS: dict[str, ProgramRules] = {
+    # Testing & linting
     "pytest": {
         "allowed_flags": {"-v", "-x", "-q", "--version", "--tb=short", "--tb=long", "--lf", "--ff"},
         "allowed_positional": True,
@@ -28,8 +29,38 @@ ALLOWED_PROGRAMS: dict[str, ProgramRules] = {
         "allowed_flags": {"-m", "-c"},
         "allowed_positional": True,
     },
+    # Version control (read-only)
     "git": {
-        "allowed_flags": {"status", "diff", "log", "show"},
+        "allowed_flags": {"status", "diff", "log", "show", "branch", "-a", "--oneline", "-n"},
+        "allowed_positional": True,
+    },
+    # File inspection (read-only)
+    "ls": {
+        "allowed_flags": {"-l", "-la", "-a", "-lh", "-R", "-1"},
+        "allowed_positional": True,
+    },
+    "cat": {
+        "allowed_flags": {"-n"},
+        "allowed_positional": True,
+    },
+    "head": {
+        "allowed_flags": {"-n"},
+        "allowed_positional": True,
+    },
+    "tail": {
+        "allowed_flags": {"-n", "-f"},
+        "allowed_positional": True,
+    },
+    "find": {
+        "allowed_flags": {"-name", "-type", "-maxdepth"},
+        "allowed_positional": True,
+    },
+    "grep": {
+        "allowed_flags": {"-r", "-n", "-i", "-l", "-c", "-v", "-E"},
+        "allowed_positional": True,
+    },
+    "wc": {
+        "allowed_flags": {"-l", "-w", "-c"},
         "allowed_positional": True,
     },
 }
